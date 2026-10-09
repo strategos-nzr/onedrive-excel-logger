@@ -7,8 +7,9 @@ Usage:
     logger = OneDriveExcelLogger(
         share_url="https://1drv.ms/x/s!...",      # or a SharePoint link
         client_id="<azure-app-client-id>",
-        tenant_id="<tenant-id or 'consumers'>",
+        tenant_id="<work-or-school-tenant-id>",
         worksheet="Sheet1",
+        table_name="BeamtimeRuns",
         beam_spot_size=lambda: f"{slits.hgap.get():.1f} x {slits.vgap.get():.1f} um",
     )
     RE.subscribe(logger)
@@ -18,6 +19,7 @@ import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 
 import msal
 import requests
@@ -26,7 +28,7 @@ from bluesky.callbacks import CallbackBase
 log = logging.getLogger(__name__)
 GRAPH = "https://graph.microsoft.com/v1.0"
 
-# Logical field -> header text expected in row 1 of the sheet (case-insensitive)
+# Logical field -> table header text (case-insensitive, whitespace-normalized)
 DEFAULT_COLUMNS = {
     "uid": "UID",
     "scan_id": "ScanID",
@@ -35,15 +37,6 @@ DEFAULT_COLUMNS = {
     "detector": "Detector",
     "beam_spot_size": "Beam spot size",
 }
-
-
-def _col_letter(idx):
-    """0-based column index -> Excel letter (0 -> A, 27 -> AB)."""
-    s, idx = "", idx + 1
-    while idx:
-        idx, r = divmod(idx - 1, 26)
-        s = chr(65 + r) + s
-    return s
 
 
 def _encode_share_url(url):
@@ -66,10 +59,25 @@ class OneDriveExcelLogger(CallbackBase):
         stream_name="primary",
         token_cache_path="~/.bluesky_onedrive_token.json",
         blocking=False,
+        *,
+        table_name="BeamtimeRuns",
     ):
         super().__init__()
+        if client_secret is not None:
+            raise ValueError(
+                "Excel table rows/add does not support application permissions "
+                "(client_secret). Use delegated work/school Files.ReadWrite access."
+            )
+        if tenant_id.lower() == "consumers":
+            raise ValueError(
+                "Excel table rows/add does not support personal Microsoft accounts. "
+                "Use a work/school account and tenant."
+            )
+        if not isinstance(table_name, str) or not table_name.strip():
+            raise ValueError("table_name must name an existing Excel table")
         self.share_url = share_url
         self.worksheet = worksheet
+        self.table_name = table_name
         self.columns = columns or DEFAULT_COLUMNS
         self.integration_time_keys = integration_time_keys
         self.beam_spot_size = beam_spot_size
@@ -84,46 +92,38 @@ class OneDriveExcelLogger(CallbackBase):
     def _init_auth(self, client_id, tenant_id, client_secret, username, cache_path):
         authority = f"https://login.microsoftonline.com/{tenant_id}"
         self._username = username
-        if client_secret:
-            self._app = msal.ConfidentialClientApplication(
-                client_id, authority=authority, client_credential=client_secret)
-            self._scopes = ["https://graph.microsoft.com/.default"]
-            self._confidential = True
-        else:
-            self._cache_path = os.path.expanduser(cache_path)
-            self._cache = msal.SerializableTokenCache()
-            if os.path.exists(self._cache_path):
-                self._cache.deserialize(open(self._cache_path).read())
-            self._app = msal.PublicClientApplication(
-                client_id, authority=authority, token_cache=self._cache)
-            self._scopes = ["Files.ReadWrite"]
-            self._confidential = False
+        self._cache_path = os.path.expanduser(cache_path)
+        self._cache = msal.SerializableTokenCache()
+        if os.path.exists(self._cache_path):
+            with open(self._cache_path) as f:
+                self._cache.deserialize(f.read())
+        self._app = msal.PublicClientApplication(
+            client_id, authority=authority, token_cache=self._cache)
+        self._scopes = ["Files.ReadWrite"]
 
     def _save_cache(self):
-        if not self._confidential and self._cache.has_state_changed:
+        if self._cache.has_state_changed:
             with open(self._cache_path, "w") as f:
                 f.write(self._cache.serialize())
 
     def _token(self):
-        if self._confidential:
-            result = self._app.acquire_token_for_client(scopes=self._scopes)
-        else:
-            accounts = self._app.get_accounts(username=self._username)
-            result = (self._app.acquire_token_silent(self._scopes, account=accounts[0])
-                      if accounts else None)
-            if not result:
-                flow = self._app.initiate_device_flow(scopes=self._scopes)
-                print(flow["message"])
-                result = self._app.acquire_token_by_device_flow(flow)
-            self._save_cache()
+        accounts = self._app.get_accounts(username=self._username)
+        result = (self._app.acquire_token_silent(self._scopes, account=accounts[0])
+                  if accounts else None)
+        if not result:
+            flow = self._app.initiate_device_flow(scopes=self._scopes)
+            print(flow["message"])
+            result = self._app.acquire_token_by_device_flow(flow)
+        self._save_cache()
         if "access_token" not in result:
             raise RuntimeError(f"Graph auth failed: {result.get('error_description')}")
         return result["access_token"]
 
     def login(self):
-        """Call once at the start of the beamtime so device-code login happens up front."""
+        """Sign in and validate the existing table before starting the beamtime."""
         self._token()
-        self._resolve_item()
+        with self._lock:
+            self._resolve_table()
 
     def _req(self, method, url, **kw):
         h = {"Authorization": f"Bearer {self._token()}"}
@@ -136,28 +136,47 @@ class OneDriveExcelLogger(CallbackBase):
             item = self._req("GET", f"{GRAPH}/shares/{_encode_share_url(self.share_url)}/driveItem")
             self._drive_item = (item["parentReference"]["driveId"], item["id"])
         d, i = self._drive_item
-        return f"{GRAPH}/drives/{d}/items/{i}/workbook/worksheets/{self.worksheet}"
+        return (
+            f"{GRAPH}/drives/{quote(d, safe='')}/items/{quote(i, safe='')}"
+            f"/workbook/worksheets/{quote(self.worksheet, safe='')}"
+        )
+
+    def _resolve_table(self):
+        ws = self._resolve_item()
+        table = self._req("GET", f"{ws}/tables/{quote(self.table_name, safe='')}")
+        url = f"{ws}/tables/{quote(table['id'], safe='')}"
+        columns = []
+        page_url = f"{url}/columns"
+        while page_url:
+            page = self._req("GET", page_url)
+            columns.extend(page["value"])
+            page_url = page.get("@odata.nextLink")
+        columns.sort(key=lambda column: column["index"])
+        headers = [" ".join(column["name"].split()).casefold() for column in columns]
+        mapping = {}
+        for field, header in self.columns.items():
+            normalized = " ".join(header.split()).casefold()
+            matches = [index for index, name in enumerate(headers) if name == normalized]
+            if not matches:
+                raise ValueError(f"Required column {header!r} missing from table {self.table_name!r}")
+            if len(matches) != 1 or matches[0] in mapping:
+                raise ValueError(f"Ambiguous column {header!r} in table {self.table_name!r}")
+            mapping[matches[0]] = field
+        return url, headers, mapping
 
     def _append_row(self, record):
         with self._lock:
-            ws = self._resolve_item()
-            used = self._req("GET", f"{ws}/usedRange(valuesOnly=true)")
-            values = used.get("values") or [[]]
-            headers = [str(h).strip().lower() for h in values[0]]
-            addr = used["address"].split("!")[-1].split(":")[0]
-            start_row = int("".join(c for c in addr if c.isdigit()) or 1)
-            next_row = start_row + used.get("rowCount", len(values))
-
-            for field, header in self.columns.items():
-                try:
-                    col = headers.index(header.lower())
-                except ValueError:
-                    log.warning("Column %r not found in sheet header; skipping", header)
-                    continue
-                cell = f"{_col_letter(col)}{next_row}"
-                self._req("PATCH", f"{ws}/range(address='{cell}')",
-                          json={"values": [[record.get(field, "")]]})
-            log.info("Logged run %s to Excel row %d", record.get("uid"), next_row)
+            table, headers, mapping = self._resolve_table()
+            row = [record.get(mapping[index], "") if index in mapping else ""
+                   for index in range(len(headers))]
+            # Do not retry this POST: a timeout may occur after Graph has appended it.
+            result = self._req("POST", f"{table}/rows/add",
+                               json={"index": None, "values": [row]})
+            index = result.get("index")
+            if index is None and result.get("value"):
+                index = result["value"][0].get("index")
+            log.info("Logged run %s to Excel table %s (returned row index: %s)",
+                     record.get("uid"), self.table_name, index)
 
     def _reset(self):
         self._start = None
